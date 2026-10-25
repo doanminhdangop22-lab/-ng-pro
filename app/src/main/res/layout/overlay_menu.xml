@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="220dp"
+    android:layout_height="wrap_content"
+    android:orientation="vertical">
+
+    <!-- Toggle button / drag handle -->
+    <TextView
+        android:id="@+id/btnToggle"
+        android:layout_width="match_parent"
+        android:layout_height="36dp"
+        android:background="#cc1a1a"
+        android:gravity="center"
+        android:text="⚔  BF2 HACK"
+        android:textColor="#ffffff"
+        android:textSize="13sp"
+        android:textStyle="bold"
+        android:fontFamily="monospace" />
+
+    <!-- Collapsible panel -->
+    <LinearLayout
+        android:id="@+id/menuPanel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="#dd111111"
+        android:orientation="vertical"
+        android:padding="8dp">
+
+        <Switch android:id="@+id/swGodMode"
+            style="@style/HackSwitch"
+            android:text="☠  God Mode (vô địch)" />
+
+        <Switch android:id="@+id/swOneHit"
+            style="@style/HackSwitch"
+            android:text="💀  One Hit Kill" />
+
+        <Switch android:id="@+id/swMaxDamage"
+            style="@style/HackSwitch"
+            android:text="⚡  Max Damage ×100" />
+
+        <Switch android:id="@+id/swUnlimitedCoins"
+            style="@style/HackSwitch"
+            android:text="🪙  Vô hạn Coins" />
+
+        <Switch android:id="@+id/swUnlimitedGems"
+            style="@style/HackSwitch"
+            android:text="💎  Vô hạn Gems" />
+
+        <Switch android:id="@+id/swUnlimitedEnergy"
+            style="@style/HackSwitch"
+            android:text="⚡  Vô hạn Energy" />
+
+        <Switch android:id="@+id/swAutoWin"
+            style="@style/HackSwitch"
+            android:text="🏆  Auto Win" />
+
+        <Switch android:id="@+id/swNoKnockback"
+            style="@style/HackSwitch"
+            android:text="🛡  No Knockback" />
+
+        <View android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#333333"
+            android:layout_marginVertical="6dp"/>
+
+        <!-- Speed hack row -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <Switch android:id="@+id/swSpeed"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="🏃  Speed"
+                android:textColor="#ffffff"
+                android:textSize="12sp" />
+
+            <TextView android:id="@+id/tvSpeedVal"
+                android:layout_width="36dp"
+                android:layout_height="wrap_content"
+                android:text="2.0x"
+                android:textColor="#e63c3c"
+                android:textSize="11sp"
+                android:gravity="end" />
+        </LinearLayout>
+
+        <SeekBar android:id="@+id/seekSpeed"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:enabled="false"
+            android:progressTint="#e63c3c"
+            android:thumbTint="#e63c3c"
+            android:layout_marginBottom="4dp"/>
+
+    </LinearLayout>
+
+</LinearLayout>
